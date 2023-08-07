@@ -27,6 +27,7 @@ use ssz::Encode;
 use ssz_types::BitList;
 use thiserror::Error;
 use tokio::{
+    sync::broadcast,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
 };
@@ -123,7 +124,9 @@ pub enum OverlayCommand<TContentKey> {
         callback: oneshot::Sender<Vec<Enr>>,
     },
     /// Sets up an event stream where the overlay server will return various events.
-    RequestEventStream(oneshot::Sender<mpsc::Receiver<EventEnvelope>>),
+    RequestEventStream(oneshot::Sender<broadcast::Receiver<EventEnvelope>>),
+    /// Handle an event sent from another overlay OR the discovery.
+    Event(EventEnvelope),
 }
 
 /// An overlay request error.
@@ -311,7 +314,7 @@ pub struct OverlayService<TContentKey, TMetric, TValidator, TStore> {
     /// Validator for overlay network content.
     validator: Arc<TValidator>,
     /// A channel that the overlay service emits events on.
-    event_stream: Option<mpsc::Sender<EventEnvelope>>,
+    event_stream: broadcast::Sender<EventEnvelope>,
 }
 
 impl<
@@ -360,6 +363,7 @@ where
         };
 
         let (response_tx, response_rx) = mpsc::unbounded_channel();
+        let (event_stream, _) = broadcast::channel(100);
 
         tokio::spawn(async move {
             let mut service = Self {
@@ -384,7 +388,7 @@ where
                 phantom_metric: PhantomData,
                 metrics,
                 validator,
-                event_stream: None,
+                event_stream,
             };
 
             info!(protocol = %overlay_protocol, "Starting overlay service");
@@ -476,6 +480,7 @@ where
                 Some(command) = self.command_rx.recv() => {
                     match command {
                         OverlayCommand::Request(request) => self.process_request(request),
+                        OverlayCommand::Event(event) => self.process_event(event),
                         OverlayCommand::FindContentQuery { target, callback, is_trace } => {
                             if let Some(query_id) = self.init_find_content_query(target.clone(), Some(callback), is_trace) {
                                 trace!(
@@ -496,11 +501,7 @@ where
                             }
                         }
                         OverlayCommand::RequestEventStream(callback) => {
-                            // the channel size needs to be large to handle many events
-                            let channel_size = 100;
-                            let (event_stream, event_stream_recv) = mpsc::channel(channel_size);
-                            self.event_stream = Some(event_stream);
-                            if callback.send(event_stream_recv).is_err() {
+                            if callback.send(self.event_stream.subscribe()).is_err() {
                                 error!("Failed to return the event stream channel");
                             }
                         }
@@ -1004,6 +1005,35 @@ where
         }
     }
 
+    fn process_event(&mut self, event: EventEnvelope) {
+        trace!(
+            "Protocol={} Received new event={:?} from protocol{}",
+            self.protocol,
+            event,
+            event.protocol
+        );
+        match event.payload {
+            OverlayEvent::PeerDisconnected(node_id) => {
+                // Mark the node as disconnected(if present) && remove it from the ping queue(if queued)
+                // Don't re-send event.
+                let _ = self.update_node_connection_state(
+                    node_id,
+                    ConnectionState::Disconnected,
+                    false,
+                );
+                self.peers_to_ping.remove(&node_id);
+            }
+            OverlayEvent::PeerUpdatedRecord {
+                node_id: _,
+                new_record,
+                prev_record: _,
+            } => self.process_discovered_enrs(vec![new_record]),
+            _ => {
+                warn!("Only peer-disconnected and peer-updated-record events are currently handled")
+            }
+        }
+    }
+
     /// Builds a `Pong` response for a `Ping` request.
     fn handle_ping(&self, request: Ping, source: &NodeId, request_id: RequestId) -> Pong {
         trace!(
@@ -1347,7 +1377,7 @@ where
         // update the node's position in the kbucket. If the node is not in the routing table, then
         // we cannot construct a new entry for sure, because we only have the node ID, not the ENR.
         if is_node_in_table {
-            match self.update_node_connection_state(source, ConnectionState::Connected) {
+            match self.update_node_connection_state(source, ConnectionState::Connected, false) {
                 Ok(_) => {}
                 Err(_) => {
                     // If the update fails, then remove the node from the ping queue.
@@ -1415,7 +1445,7 @@ where
 
         // Attempt to mark the node as disconnected.
         let node_id = destination.node_id();
-        let _ = self.update_node_connection_state(node_id, ConnectionState::Disconnected);
+        let _ = self.update_node_connection_state(node_id, ConnectionState::Disconnected, true);
         // Remove the node from the ping queue.
         self.peers_to_ping.remove(&node_id);
     }
@@ -1457,9 +1487,11 @@ where
         match status.state {
             ConnectionState::Disconnected => self.connect_node(node, status.direction),
             ConnectionState::Connected => {
-                match self
-                    .update_node_connection_state(source.node_id(), ConnectionState::Connected)
-                {
+                match self.update_node_connection_state(
+                    source.node_id(),
+                    ConnectionState::Connected,
+                    false,
+                ) {
                     Ok(_) => {}
                     Err(_) => {
                         // If the update fails, then remove the node from the ping queue.
@@ -2203,6 +2235,7 @@ where
         &mut self,
         node_id: NodeId,
         state: ConnectionState,
+        send_event: bool,
     ) -> Result<(), FailureReason> {
         let key = kbucket::Key::from(node_id);
 
@@ -2227,6 +2260,9 @@ where
                     updated.conn_state = ?state,
                     "Node connection state updated",
                 );
+                if send_event && state == ConnectionState::Disconnected {
+                    self.send_event(OverlayEvent::PeerDisconnected(node_id))
+                }
                 Ok(())
             }
         }
@@ -2477,14 +2513,18 @@ where
     }
 
     /// Send `OverlayEvent` to the event stream.
-    #[allow(dead_code)] // TODO: remove when used
-    fn send_event(&mut self, event: OverlayEvent) {
-        if let Some(stream) = self.event_stream.as_mut() {
-            let event = EventEnvelope::new(event);
-            if let Err(mpsc::error::TrySendError::Closed(_)) = stream.try_send(event) {
-                // If the stream has been dropped prevent future attempts to send events
-                self.event_stream = None;
-            }
+    fn send_event(&self, event: OverlayEvent) {
+        trace!(
+            "Sending event={:?} to event-stream from protocol {}",
+            event,
+            self.protocol
+        );
+        let event = EventEnvelope::new(event, self.protocol.clone());
+        if let Err(err) = self.event_stream.send(event) {
+            error!(
+                error = %err,
+                "Error sending event through event-stream"
+            )
         }
     }
 }
@@ -2731,7 +2771,7 @@ mod tests {
             phantom_metric: PhantomData,
             metrics,
             validator,
-            event_stream: None,
+            event_stream: broadcast::channel(100).0,
         }
     }
 
@@ -3322,7 +3362,7 @@ mod tests {
             _ => panic!(),
         };
 
-        let _ = service.update_node_connection_state(node_id, ConnectionState::Connected);
+        let _ = service.update_node_connection_state(node_id, ConnectionState::Connected, false);
 
         match service.kbuckets.write().entry(&key) {
             kbucket::Entry::Present(_entry, status) => {
@@ -3364,7 +3404,7 @@ mod tests {
             _ => panic!(),
         };
 
-        let _ = service.update_node_connection_state(node_id, ConnectionState::Disconnected);
+        let _ = service.update_node_connection_state(node_id, ConnectionState::Disconnected, true);
 
         match service.kbuckets.write().entry(&key) {
             kbucket::Entry::Present(_entry, status) => {
@@ -3971,8 +4011,8 @@ mod tests {
     async fn test_event_stream() {
         // Get overlay service event stream
         let mut service = task::spawn(build_service());
-        let (sender, mut receiver) = mpsc::channel(1);
-        service.event_stream = Some(sender);
+        let (sender, mut receiver) = broadcast::channel(1);
+        service.event_stream = sender;
         // Emit LightClientUpdate event
         service.send_event(OverlayEvent::LightClientOptimisticUpdate);
         // Check that the event is received
