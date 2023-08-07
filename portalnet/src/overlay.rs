@@ -18,7 +18,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, warn};
 use utp_rs::socket::UtpSocket;
@@ -210,6 +210,19 @@ where
 
         // Send the request and wait on the response.
         self.send_overlay_request(request, direction).await
+    }
+
+    /// Processes a single EventEnvelope from a different overlay.
+    pub async fn process_one_event(&self, event: EventEnvelope) -> Result<(), OverlayRequestError> {
+        if let Err(err) = self.command_tx.send(OverlayCommand::Event(event)) {
+            warn!(
+                protocol = %self.protocol,
+                error = %err,
+                "Error submitting event to service",
+            );
+            return Err(OverlayRequestError::ChannelFailure(err.to_string()));
+        }
+        Ok(())
     }
 
     /// Propagate gossip accepted content via OFFER/ACCEPT, return number of peers propagated
@@ -710,7 +723,7 @@ where
     /// Creates an event stream channel which can be polled to receive overlay events.
     pub fn event_stream(
         &self,
-    ) -> impl Future<Output = anyhow::Result<mpsc::Receiver<EventEnvelope>>> + 'static {
+    ) -> impl Future<Output = anyhow::Result<broadcast::Receiver<EventEnvelope>>> + 'static {
         let channel = self.command_tx.clone();
 
         async move {
