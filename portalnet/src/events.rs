@@ -13,25 +13,38 @@ use super::types::messages::ProtocolId;
 use ethportal_api::types::enr::Enr;
 use ethportal_api::utils::bytes::{hex_encode, hex_encode_upper};
 
+/// The medium of communication between the main events handler and an overlay.
+pub struct OverlayChannels {
+    /// Send a message to an overlay.
+    pub tx: Option<mpsc::UnboundedSender<OverlayMessage>>,
+    /// Received submitted events from an overlay.
+    pub rx: Option<broadcast::Receiver<EventEnvelope>>,
+}
+
+type OverlayChannelsTuple = (
+    Option<mpsc::UnboundedSender<OverlayMessage>>,
+    Option<broadcast::Receiver<EventEnvelope>>,
+);
+
+impl From<OverlayChannelsTuple> for OverlayChannels {
+    fn from(tup: OverlayChannelsTuple) -> Self {
+        OverlayChannels {
+            tx: tup.0,
+            rx: tup.1,
+        }
+    }
+}
+
 /// Main handler for portal network events
 pub struct PortalnetEvents {
     /// Receive Discv5 talk requests.
     pub talk_req_receiver: mpsc::Receiver<TalkRequest>,
     /// Send overlay `TalkReq` to history network && receive event subscriptions
-    pub history_overlay_tx_rx: (
-        Option<mpsc::UnboundedSender<OverlayMessage>>,
-        Option<broadcast::Receiver<EventEnvelope>>,
-    ),
+    pub history_channels: OverlayChannels,
     /// Send overlay `TalkReq` to state network && receive event subscriptions
-    pub state_overlay_tx_rx: (
-        Option<mpsc::UnboundedSender<OverlayMessage>>,
-        Option<broadcast::Receiver<EventEnvelope>>,
-    ),
+    pub state_channels: OverlayChannels,
     /// Send overlay `TalkReq` to beacon network && receive event subscriptions
-    pub beacon_overlay_tx_rx: (
-        Option<mpsc::UnboundedSender<OverlayMessage>>,
-        Option<broadcast::Receiver<EventEnvelope>>,
-    ),
+    pub beacon_channels: OverlayChannels,
     /// Send TalkReq events with "utp" protocol id to `UtpListener`
     pub utp_talk_reqs: mpsc::UnboundedSender<TalkRequest>,
 }
@@ -39,25 +52,16 @@ pub struct PortalnetEvents {
 impl PortalnetEvents {
     pub async fn new(
         talk_req_receiver: mpsc::Receiver<TalkRequest>,
-        history_overlay_tx_rx: (
-            Option<mpsc::UnboundedSender<OverlayMessage>>,
-            Option<broadcast::Receiver<EventEnvelope>>,
-        ),
-        state_overlay_tx_rx: (
-            Option<mpsc::UnboundedSender<OverlayMessage>>,
-            Option<broadcast::Receiver<EventEnvelope>>,
-        ),
-        beacon_overlay_tx_rx: (
-            Option<mpsc::UnboundedSender<OverlayMessage>>,
-            Option<broadcast::Receiver<EventEnvelope>>,
-        ),
+        history_channels: OverlayChannelsTuple,
+        state_channels: OverlayChannelsTuple,
+        beacon_channels: OverlayChannelsTuple,
         utp_talk_reqs: mpsc::UnboundedSender<TalkRequest>,
     ) -> Self {
         Self {
             talk_req_receiver,
-            history_overlay_tx_rx,
-            state_overlay_tx_rx,
-            beacon_overlay_tx_rx,
+            history_channels: history_channels.into(),
+            state_channels: state_channels.into(),
+            beacon_channels: beacon_channels.into(),
             utp_talk_reqs,
         }
     }
@@ -66,13 +70,13 @@ impl PortalnetEvents {
     pub async fn start(mut self) {
         let mut receivers = vec![];
 
-        if let Some(rx) = self.history_overlay_tx_rx.1.take() {
+        if let Some(rx) = self.history_channels.rx.take() {
             receivers.push(rx);
         }
-        if let Some(rx) = self.beacon_overlay_tx_rx.1.take() {
+        if let Some(rx) = self.beacon_channels.rx.take() {
             receivers.push(rx);
         }
-        if let Some(rx) = self.state_overlay_tx_rx.1.take() {
+        if let Some(rx) = self.state_channels.rx.take() {
             receivers.push(rx);
         }
 
@@ -106,17 +110,17 @@ impl PortalnetEvents {
         match protocol_id {
             Ok(protocol) => match protocol {
                 ProtocolId::History => self.send_overlay_message(
-                    &self.history_overlay_tx_rx.0,
+                    &self.history_channels.tx,
                     OverlayMessage::Request(request),
                     "history",
                 ),
                 ProtocolId::Beacon => self.send_overlay_message(
-                    &self.beacon_overlay_tx_rx.0,
+                    &self.beacon_channels.tx,
                     OverlayMessage::Request(request),
                     "beacon",
                 ),
                 ProtocolId::State => self.send_overlay_message(
-                    &self.state_overlay_tx_rx.0,
+                    &self.state_channels.tx,
                     OverlayMessage::Request(request),
                     "state",
                 ),
@@ -143,21 +147,21 @@ impl PortalnetEvents {
 
         if protocol_id != &ProtocolId::History {
             self.send_overlay_message(
-                &self.history_overlay_tx_rx.0,
+                &self.history_channels.tx,
                 OverlayMessage::Event(event.clone()),
                 "history",
             );
         }
         if protocol_id != &ProtocolId::Beacon {
             self.send_overlay_message(
-                &self.beacon_overlay_tx_rx.0,
+                &self.state_channels.tx,
                 OverlayMessage::Event(event.clone()),
                 "beacon",
             );
         }
         if protocol_id != &ProtocolId::State {
             self.send_overlay_message(
-                &self.beacon_overlay_tx_rx.0,
+                &self.state_channels.tx,
                 OverlayMessage::Event(event.clone()),
                 "state",
             );
