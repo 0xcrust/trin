@@ -1,46 +1,53 @@
-use std::fmt;
+use std::sync::Arc;
 
 use ethportal_api::types::distance::Distance;
 use ethportal_api::types::enr::Enr;
 
-/// A node in the overlay network routing table.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
+/// A node in the overlay routing table.
 pub struct Node {
-    /// The node's ENR.
-    pub enr: Enr,
-    /// The node's data radius.
+    /// A shared reference to the node's ENR.
+    pub enr: Arc<Enr>,
+    /// The node's data radius
     pub data_radius: Distance,
 }
 
+impl Clone for Node {
+    fn clone(&self) -> Self {
+        Node {
+            enr: Arc::clone(&self.enr),
+            data_radius: self.data_radius,
+        }
+    }
+}
+
 impl Node {
-    /// Creates a new node.
-    pub fn new(enr: Enr, data_radius: Distance) -> Node {
+    /// Creates a new node record
+    pub fn new(enr: Enr, data_radius: Distance) -> Self {
+        Node {
+            enr: Arc::new(enr),
+            data_radius,
+        }
+    }
+
+    /// Creates a new node record from a shared instance
+    pub fn new_from_arc(enr: Arc<Enr>, data_radius: Distance) -> Self {
         Node { enr, data_radius }
     }
 
-    /// Returns the ENR of the node.
-    pub fn enr(&self) -> Enr {
-        self.enr.clone()
+    /// Returns a reference to the Enr of a node.
+    pub fn enr(&self) -> &Enr {
+        &self.enr
     }
 
     /// Returns the data radius of the node.
     pub fn data_radius(&self) -> Distance {
         self.data_radius
     }
-
-    /// Sets the ENR of the node.
-    pub fn set_enr(&mut self, enr: Enr) {
-        self.enr = enr;
-    }
-
-    /// Sets the data radius of the node.
-    pub fn set_data_radius(&mut self, radius: Distance) {
-        self.data_radius = radius;
-    }
 }
 
-impl fmt::Display for Node {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "Node(node_id={}, radius={})",

@@ -407,9 +407,18 @@ where
         for enr in bootnode_enrs {
             let node_id = enr.node_id();
 
+            // Insert the node into the global store of records. Report if an update was made
+            let (enr, updated) = self.discovery.insert_record(enr);
+            if updated {
+                self.send_event(OverlayEvent::EnrUpdated {
+                    node_id,
+                    new_record: Arc::clone(&enr),
+                });
+            }
+
             // TODO: Decide default data radius, and define a constant. Or if there is an
             // associated database, then look for a radius value there.
-            let node = Node::new(enr, Distance::MAX);
+            let node = Node::new_from_arc(enr, Distance::MAX);
             let status = NodeStatus {
                 state: ConnectionState::Disconnected,
                 direction: ConnectionDirection::Outgoing,
@@ -534,7 +543,7 @@ where
                     // If the node is in the routing table, then ping and re-queue the node.
                     let key = kbucket::Key::from(node_id);
                     if let kbucket::Entry::Present(ref mut entry, _) = self.kbuckets.write().entry(&key) {
-                        self.ping_node(&entry.value().enr());
+                        self.ping_node(entry.value().enr());
                         self.peers_to_ping.insert(node_id);
                     }
                 }
@@ -915,7 +924,7 @@ where
 
             // If the content is within the node's radius, then offer the node the content.
             let is_within_radius =
-                TMetric::distance(&node_id.raw(), &content_id) <= node.data_radius;
+                TMetric::distance(&node_id.raw(), &content_id) <= node.data_radius();
             if is_within_radius {
                 let content_items = vec![(content_key.clone().into(), content.clone())];
                 let offer_request = Request::PopulatedOffer(PopulatedOffer { content_items });
@@ -923,7 +932,7 @@ where
                 let request = OverlayRequest::new(
                     offer_request,
                     RequestDirection::Outgoing {
-                        destination: node.enr(),
+                        destination: node.enr().clone(),
                     },
                     None,
                     None,
@@ -1014,22 +1023,41 @@ where
         );
         match event.payload {
             OverlayEvent::PeerDisconnected(node_id) => {
-                // Mark the node as disconnected(if present) && remove it from the ping queue(if queued)
-                // Don't re-send event.
-                let _ = self.update_node_connection_state(
-                    node_id,
-                    ConnectionState::Disconnected,
-                    false,
-                );
+                // Mark the node as disconnected & remove it from the ping queue. We don't notify other
+                // overlays since it's expected that they received the same message.
+                let _ =
+                    self.update_node_connection_state(node_id, ConnectionState::Disconnected, true);
                 self.peers_to_ping.remove(&node_id);
             }
-            OverlayEvent::PeerUpdatedRecord {
-                node_id: _,
+            OverlayEvent::EnrUpdated {
+                node_id,
                 new_record,
-                prev_record: _,
-            } => self.process_discovered_enrs(vec![new_record]),
+            } => {
+                let key = kbucket::Key::from(node_id);
+                let optional_node = match self.kbuckets.write().entry(&key) {
+                    kbucket::Entry::Present(entry, _) => Some(entry.value().clone()),
+                    kbucket::Entry::Pending(ref mut entry, _) => Some(entry.value().clone()),
+                    _ => None,
+                };
+
+                // We only update nodes we know about.
+                if let Some(entry) = optional_node {
+                    if let UpdateResult::Failed(reason) = self.kbuckets.write().update_node(
+                        &key,
+                        Node::new_from_arc(new_record, entry.data_radius()),
+                        None,
+                    ) {
+                        self.peers_to_ping.remove(&node_id);
+                        debug!(
+                            peer = %node_id,
+                            error = ?reason,
+                            "Error updating entry for discovered node",
+                        );
+                    }
+                }
+            }
             _ => {
-                warn!("Only peer-disconnected and peer-updated-record events are currently handled")
+                warn!("Only disconnection & enr-updated events are currently handled")
             }
         }
     }
@@ -1389,11 +1417,16 @@ where
             // address cache. If an entry is found, then attempt to insert the node as a connected
             // peer.
             if let Some(node_addr) = self.discovery.cached_node_addr(&source) {
+                // We insert or retrieve a new record into/from the global set.
+                let (enr, updated) = self.discovery.insert_record(node_addr.enr);
+                if updated {
+                    self.send_event(OverlayEvent::EnrUpdated {
+                        node_id: source,
+                        new_record: enr.clone(),
+                    })
+                }
                 // TODO: Decide default data radius, and define a constant.
-                let node = Node {
-                    enr: node_addr.enr,
-                    data_radius: Distance::MAX,
-                };
+                let node = Node::new_from_arc(enr, Distance::MAX);
                 self.connect_node(node, ConnectionDirection::Incoming);
             }
         }
@@ -1418,12 +1451,12 @@ where
             // If the ENR sequence number in pong is less than the ENR sequence number for the routing
             // table entry, then request the node.
             if node.enr().seq() < ping.enr_seq {
-                self.request_node(&node.enr());
+                self.request_node(node.enr());
             }
 
             let data_radius: Distance = ping.custom_payload.into();
-            if node.data_radius != data_radius {
-                self.update_node_radius(node.enr(), data_radius);
+            if node.data_radius() != data_radius {
+                self.update_node_radius(Arc::clone(&node.enr), data_radius);
             }
         }
     }
@@ -1445,7 +1478,7 @@ where
 
         // Attempt to mark the node as disconnected.
         let node_id = destination.node_id();
-        let _ = self.update_node_connection_state(node_id, ConnectionState::Disconnected, true);
+        let _ = self.update_node_connection_state(node_id, ConnectionState::Disconnected, false);
         // Remove the node from the ping queue.
         self.peers_to_ping.remove(&node_id);
     }
@@ -1462,13 +1495,21 @@ where
         // use the existing entry's value and direction. Otherwise, build a new entry from
         // the source ENR and establish a connection in the outgoing direction, because this
         // node is responding to our request.
-        let key = kbucket::Key::from(source.node_id());
+        let node_id = source.node_id();
+        let key = kbucket::Key::from(node_id);
         let (node, status) = match self.kbuckets.write().entry(&key) {
             kbucket::Entry::Present(ref mut entry, status) => (entry.value().clone(), status),
             kbucket::Entry::Pending(ref mut entry, status) => (entry.value().clone(), status),
             _ => {
+                let (enr, updated) = self.discovery.insert_record(source.clone());
+                if updated {
+                    self.send_event(OverlayEvent::EnrUpdated {
+                        node_id,
+                        new_record: enr.clone(),
+                    });
+                }
                 // TODO: Decide default data radius, and define a constant.
-                let node = Node::new(source.clone(), Distance::MAX);
+                let node = Node::new_from_arc(enr, Distance::MAX);
                 let status = NodeStatus {
                     state: ConnectionState::Disconnected,
                     direction: ConnectionDirection::Outgoing,
@@ -1487,15 +1528,12 @@ where
         match status.state {
             ConnectionState::Disconnected => self.connect_node(node, status.direction),
             ConnectionState::Connected => {
-                match self.update_node_connection_state(
-                    source.node_id(),
-                    ConnectionState::Connected,
-                    false,
-                ) {
+                match self.update_node_connection_state(node_id, ConnectionState::Connected, false)
+                {
                     Ok(_) => {}
                     Err(_) => {
                         // If the update fails, then remove the node from the ping queue.
-                        self.peers_to_ping.remove(&source.node_id());
+                        self.peers_to_ping.remove(&node_id);
                     }
                 }
             }
@@ -1760,22 +1798,22 @@ where
         };
         if let Some(node) = optional_node {
             if node.enr().seq() < pong.enr_seq {
-                self.request_node(&node.enr());
+                self.request_node(node.enr());
             }
 
             let data_radius: Distance = pong.custom_payload.into();
-            if node.data_radius != data_radius {
-                self.update_node_radius(source, data_radius);
+            if node.data_radius() != data_radius {
+                self.update_node_radius(Arc::clone(&node.enr), data_radius);
             }
         }
     }
 
     /// Update the recorded radius of a node in our routing table.
-    fn update_node_radius(&self, enr: Enr, data_radius: Distance) {
+    fn update_node_radius(&self, enr: Arc<Enr>, data_radius: Distance) {
         let node_id = enr.node_id();
         let key = kbucket::Key::from(node_id);
 
-        let updated_node = Node { enr, data_radius };
+        let updated_node = Node::new_from_arc(enr, data_radius);
 
         if let UpdateResult::Failed(_) = self.kbuckets.write().update_node(&key, updated_node, None)
         {
@@ -1925,17 +1963,22 @@ where
                 _ => None,
             };
 
+            // Insert the record into the global routing table.
+            let (enr, updated) = self.discovery.insert_record(enr);
+            if updated {
+                self.send_event(OverlayEvent::EnrUpdated {
+                    node_id,
+                    new_record: Arc::clone(&enr),
+                });
+            }
+
             // If the node is in the routing table, then check to see if we should update its entry.
             // If the node is not in the routing table, then add the node in a disconnected state.
             // A subsequent ping will establish connectivity with the node. If the insertion succeeds,
             // then add the node to the ping queue. Ignore insertion failures.
             if let Some(node) = optional_node {
                 if node.enr().seq() < enr.seq() {
-                    let updated_node = Node {
-                        enr,
-                        data_radius: node.data_radius(),
-                    };
-
+                    let updated_node = Node::new_from_arc(enr, node.data_radius());
                     // The update removed the node because it would violate the incoming peers condition
                     // or a bucket/table filter. Remove the node from the ping queue.
                     if let UpdateResult::Failed(reason) =
@@ -1950,7 +1993,8 @@ where
                     }
                 }
             } else {
-                let node = Node::new(enr, Distance::MAX);
+                let node = Node::new_from_arc(enr, Distance::MAX);
+
                 let status = NodeStatus {
                     state: ConnectionState::Disconnected,
                     direction: ConnectionDirection::Outgoing,
@@ -1970,7 +2014,7 @@ where
                         if let kbucket::Entry::Present(node_to_ping, _) =
                             kbuckets.entry(&disconnected)
                         {
-                            self.ping_node(&node_to_ping.value().enr());
+                            self.ping_node(node_to_ping.value().enr());
                         }
                     }
                     other => {
@@ -2225,7 +2269,7 @@ where
         // Ping node to check for connectivity. See comment above for reasoning.
         if let Some(key) = node_to_ping {
             if let kbucket::Entry::Present(ref mut entry, _) = self.kbuckets.write().entry(&key) {
-                self.ping_node(&entry.value().enr());
+                self.ping_node(entry.value().enr());
             }
         }
     }
@@ -2235,9 +2279,13 @@ where
         &mut self,
         node_id: NodeId,
         state: ConnectionState,
-        send_event: bool,
+        was_info_from_event: bool,
     ) -> Result<(), FailureReason> {
         let key = kbucket::Key::from(node_id);
+
+        if state == ConnectionState::Disconnected && !was_info_from_event {
+            self.send_event(OverlayEvent::PeerDisconnected(node_id))
+        }
 
         match self.kbuckets.write().update_node_status(&key, state, None) {
             UpdateResult::Failed(reason) => match reason {
@@ -2260,9 +2308,6 @@ where
                     updated.conn_state = ?state,
                     "Node connection state updated",
                 );
-                if send_event && state == ConnectionState::Disconnected {
-                    self.send_event(OverlayEvent::PeerDisconnected(node_id))
-                }
                 Ok(())
             }
         }
@@ -2273,7 +2318,7 @@ where
         self.kbuckets
             .write()
             .iter()
-            .map(|entry| entry.node.value.enr())
+            .map(|entry| entry.node.value.enr().clone())
             .collect()
     }
 
@@ -2297,7 +2342,7 @@ where
                 .into_iter()
                 .map(|entry| entry.node.value.clone())
             {
-                nodes_to_send.push(SszEnr::new(node.enr()));
+                nodes_to_send.push(SszEnr::new(node.enr().clone()));
             }
         }
         nodes_to_send
@@ -2353,7 +2398,7 @@ where
         all_nodes
             .iter()
             .take(max_nodes)
-            .map(|closest| closest.value.enr.clone())
+            .map(|closest| closest.value.enr().clone())
             .collect()
     }
 
@@ -2374,7 +2419,7 @@ where
                 .kbuckets
                 .write()
                 .closest_values(&target_key)
-                .map(|closest| closest.value.enr)
+                .map(|closest| closest.value.enr().clone())
                 .take(self.query_num_results)
                 .collect();
             // `closest_values` return is empty if querying our own Node ID
@@ -2484,7 +2529,7 @@ where
         // Check whether we know this node id in our routing table.
         let key = kbucket::Key::from(*node_id);
         if let kbucket::Entry::Present(entry, _) = self.kbuckets.write().entry(&key) {
-            return Some(entry.value().clone().enr());
+            return Some(entry.value().enr().clone());
         }
 
         // Check the existing find node queries for the ENR.
@@ -2560,7 +2605,7 @@ pub fn propagate_gossip_cross_thread<TContentKey: OverlayContentKey>(
                 XorMetric::distance(&content_key.content_id(), &node.key.preimage().raw())
                     < node.value.data_radius()
             })
-            .map(|node| node.value.enr())
+            .map(|node| node.value.enr().clone())
             .collect();
 
         // Continue if no nodes are interested in the content
@@ -2774,6 +2819,11 @@ mod tests {
             event_stream: broadcast::channel(100).0,
         }
     }
+
+    //fn generate_random_remote_arc_enr() -> (CombinedKey, Arc<Enr>) {
+    //    let (key, enr) = generate_random_remote_enr();
+    //    (key, Arc::new(enr))
+    //}
 
     #[test_log::test(tokio::test)]
     #[serial]
@@ -3083,7 +3133,7 @@ mod tests {
         // Node should be present with ENR sequence number equal to 2.
         match service.kbuckets.write().entry(&key1) {
             kbucket::Entry::Present(entry, _status) => {
-                assert_eq!(2, entry.value().enr.seq());
+                assert_eq!(2, entry.value().enr().seq());
             }
             _ => panic!(),
         };
@@ -3092,7 +3142,7 @@ mod tests {
         // Node should be present with ENR sequence number equal to 1.
         match service.kbuckets.write().entry(&key2) {
             kbucket::Entry::Present(entry, _status) => {
-                assert_eq!(1, entry.value().enr.seq());
+                assert_eq!(1, entry.value().enr().seq());
             }
             _ => panic!(),
         };
@@ -3113,16 +3163,13 @@ mod tests {
 
         let (_, enr) = generate_random_remote_enr();
         let key = kbucket::Key::from(enr.node_id());
-        let peer = Node {
-            enr,
-            data_radius: Distance::MAX,
-        };
+        let peer = Node::new(enr, Distance::MAX);
         let _ = service
             .kbuckets
             .write()
             .insert_or_update(&key, peer.clone(), status);
 
-        let peer_node_ids: Vec<NodeId> = vec![peer.enr.node_id()];
+        let peer_node_ids: Vec<NodeId> = vec![peer.enr().node_id()];
 
         // Node has maximum radius, so there should be one offer in the channel.
         OverlayService::<IdentityContentKey, XorMetric, MockValidator, MemoryContentStore>::poke_content(
@@ -3138,7 +3185,7 @@ mod tests {
             assert!(matches!(req.request, Request::PopulatedOffer { .. }));
             assert_eq!(
                 RequestDirection::Outgoing {
-                    destination: peer.enr()
+                    destination: peer.enr().clone()
                 },
                 req.direction
             );
@@ -3188,10 +3235,7 @@ mod tests {
         // The first node has a maximum radius, so the content SHOULD be offered.
         let (_, enr1) = generate_random_remote_enr();
         let key1 = kbucket::Key::from(enr1.node_id());
-        let peer1 = Node {
-            enr: enr1,
-            data_radius: Distance::MAX,
-        };
+        let peer1 = Node::new(enr1, Distance::MAX);
         let _ = service
             .kbuckets
             .write()
@@ -3200,17 +3244,14 @@ mod tests {
         // The second node has a radius of zero, so the content SHOULD NOT not be offered.
         let (_, enr2) = generate_random_remote_enr();
         let key2 = kbucket::Key::from(enr2.node_id());
-        let peer2 = Node {
-            enr: enr2,
-            data_radius: Distance::from(U256::zero()),
-        };
+        let peer2 = Node::new(enr2, Distance::from(U256::zero()));
         let _ = service
             .kbuckets
             .write()
             .insert_or_update(&key2, peer2.clone(), status);
 
         let peers = vec![peer1.clone(), peer2];
-        let peer_node_ids: Vec<NodeId> = peers.iter().map(|p| p.enr.node_id()).collect();
+        let peer_node_ids: Vec<NodeId> = peers.iter().map(|p| p.enr().node_id()).collect();
 
         // One offer should be in the channel for the maximum radius node.
         OverlayService::<IdentityContentKey, XorMetric, MockValidator, MemoryContentStore>::poke_content(
@@ -3226,7 +3267,7 @@ mod tests {
             assert!(matches!(req.request, Request::PopulatedOffer { .. }));
             assert_eq!(
                 RequestDirection::Outgoing {
-                    destination: peer1.enr()
+                    destination: peer1.enr().clone()
                 },
                 req.direction
             );
@@ -3309,7 +3350,7 @@ mod tests {
         let key = kbucket::Key::from(node_id);
 
         let data_radius = Distance::MAX;
-        let node = Node::new(enr, data_radius);
+        let node = Node::new(enr, data_radius).into();
         let connection_direction = ConnectionDirection::Outgoing;
 
         assert!(!service.peers_to_ping.contains_key(&node_id));
@@ -3341,7 +3382,7 @@ mod tests {
         let key = kbucket::Key::from(node_id);
 
         let data_radius = Distance::MAX;
-        let node = Node::new(enr, data_radius);
+        let node = Node::new(enr, data_radius).into();
 
         let connection_direction = ConnectionDirection::Outgoing;
         let status = NodeStatus {
@@ -3383,7 +3424,7 @@ mod tests {
         let key = kbucket::Key::from(node_id);
 
         let data_radius = Distance::MAX;
-        let node = Node::new(enr, data_radius);
+        let node = Node::new(enr, data_radius).into();
 
         let connection_direction = ConnectionDirection::Outgoing;
         let status = NodeStatus {
@@ -3653,10 +3694,7 @@ mod tests {
         let bootnode_key = kbucket::Key::from(bootnode_node_id);
 
         let data_radius = Distance::MAX;
-        let bootnode = Node {
-            enr: bootnode_enr.clone(),
-            data_radius,
-        };
+        let bootnode = Node::new(bootnode_enr.clone(), data_radius);
 
         let connection_direction = ConnectionDirection::Outgoing;
         let status = NodeStatus {
@@ -3708,10 +3746,7 @@ mod tests {
         let bootnode_key = kbucket::Key::from(bootnode_node_id);
 
         let data_radius = Distance::MAX;
-        let bootnode = Node {
-            enr: bootnode_enr.clone(),
-            data_radius,
-        };
+        let bootnode = Node::new(bootnode_enr.clone(), data_radius);
 
         let connection_direction = ConnectionDirection::Outgoing;
         let status = NodeStatus {
@@ -3776,10 +3811,7 @@ mod tests {
         let bootnode_key = kbucket::Key::from(bootnode_node_id);
 
         let data_radius = Distance::MAX;
-        let bootnode = Node {
-            enr: bootnode_enr.clone(),
-            data_radius,
-        };
+        let bootnode = Node::new(bootnode_enr.clone(), data_radius);
 
         let connection_direction = ConnectionDirection::Outgoing;
         let status = NodeStatus {
@@ -3841,10 +3873,7 @@ mod tests {
         let bootnode_key = kbucket::Key::from(bootnode_node_id);
 
         let data_radius = Distance::MAX;
-        let bootnode = Node {
-            enr: bootnode_enr.clone(),
-            data_radius,
-        };
+        let bootnode = Node::new(bootnode_enr.clone(), data_radius);
 
         let connection_direction = ConnectionDirection::Outgoing;
         let status = NodeStatus {
@@ -3906,10 +3935,7 @@ mod tests {
         let bootnode_key = kbucket::Key::from(bootnode_node_id);
 
         let data_radius = Distance::MAX;
-        let bootnode = Node {
-            enr: bootnode_enr.clone(),
-            data_radius,
-        };
+        let bootnode = Node::new(bootnode_enr.clone(), data_radius);
 
         let connection_direction = ConnectionDirection::Outgoing;
         let status = NodeStatus {

@@ -16,6 +16,7 @@ use crate::socket;
 use ethportal_api::types::enr::Enr;
 use ethportal_api::utils::bytes::hex_encode;
 use ethportal_api::NodeInfo;
+use std::collections::{hash_map::Entry, HashMap};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 use std::{convert::TryFrom, fmt, io, net::SocketAddr, sync::Arc};
@@ -44,6 +45,9 @@ pub struct Discovery {
     discv5: Discv5,
     /// A cache of the latest observed `NodeAddress` for a node ID.
     node_addr_cache: Arc<RwLock<LruCache<NodeId, NodeAddress>>>,
+    /// A map of the set of node records collectively held by all overlays
+    /// that run on this discovery.
+    records: Arc<RwLock<HashMap<NodeId, Arc<Enr>>>>,
     /// Indicates if the Discv5 service has been started.
     pub started: bool,
     /// The socket address that the Discv5 service listens on.
@@ -132,6 +136,7 @@ impl Discovery {
             discv5,
             node_addr_cache,
             started: false,
+            records: Default::default(),
             listen_socket: listen_all_ips,
         })
     }
@@ -275,6 +280,34 @@ impl Discovery {
 
         let response = self.discv5.talk_req(enr, protocol, request).await?;
         Ok(response)
+    }
+
+    /// Attempts to insert a node entry into the global set of records.
+    ///
+    /// - If a recent entry already exists for this node, the entry is left unchanged
+    /// and the original entry is returned.
+    /// - If no entry exists, it inserts a newly-created allocation into the map and
+    /// returns a clone of it.
+    ///
+    /// Returns a shared node && a bool indicating whether or not the record was updated.
+    #[must_use = "Used to decide whether or not the calling overlay should dispatch an event"]
+    pub fn insert_record(&self, enr: Enr) -> (Arc<Enr>, bool) {
+        match self.records.write().entry(enr.node_id()) {
+            // A more recent entry exists in the map; we simply return its clone
+            Entry::Occupied(e) if e.get().seq() < enr.seq() => (Arc::clone(e.get()), false),
+            // An outdated entry is in the map; we replace it
+            Entry::Occupied(mut e) => {
+                let new_record = Arc::new(enr);
+                e.insert(Arc::clone(&new_record));
+                (new_record, true)
+            }
+            // No entry exists in the map; we create one and return its clone
+            Entry::Vacant(e) => {
+                let new_record = Arc::new(enr);
+                e.insert(Arc::clone(&new_record));
+                (new_record, false)
+            }
+        }
     }
 }
 

@@ -249,7 +249,7 @@ where
         self.kbuckets
             .write()
             .iter()
-            .map(|entry| entry.node.value.enr())
+            .map(|entry| entry.node.value.enr().clone())
             .collect()
     }
 
@@ -283,7 +283,7 @@ where
                             };
                             (
                                 *node.key.preimage(),
-                                node.value.enr(),
+                                node.value.enr().clone(),
                                 node.status,
                                 node.value.data_radius(),
                                 client_info,
@@ -300,10 +300,7 @@ where
         let key = Key::from(enr.node_id());
         match self.kbuckets.write().insert_or_update(
             &key,
-            Node {
-                enr,
-                data_radius: Distance::MAX,
-            },
+            Node::new(enr, Distance::MAX),
             NodeStatus {
                 state: ConnectionState::Disconnected,
                 direction: ConnectionDirection::Incoming,
@@ -340,7 +337,7 @@ where
         }
         let key = Key::from(node_id);
         if let Entry::Present(entry, _) = self.kbuckets.write().entry(&key) {
-            return Ok(entry.value().enr());
+            return Ok(entry.value().enr().clone());
         }
         Err(OverlayRequestError::Failure("Couldn't get ENR".into()))
     }
