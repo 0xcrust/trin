@@ -1,7 +1,8 @@
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use discv5::enr::{CombinedKey, Enr, NodeId};
+use discv5::enr::NodeId;
 use discv5::TalkRequest;
 use futures::stream::{select_all, StreamExt};
 use tokio::sync::{broadcast, mpsc};
@@ -9,6 +10,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{error, warn};
 
 use super::types::messages::ProtocolId;
+use ethportal_api::types::enr::Enr;
 use ethportal_api::utils::bytes::{hex_encode, hex_encode_upper};
 
 /// Main handler for portal network events
@@ -194,14 +196,15 @@ pub enum OverlayMessage {
 
 /// Events that can be produced by the `OverlayProtocol` event stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OverlayEvent<Record = Enr<CombinedKey>> {
+pub enum OverlayEvent {
     LightClientOptimisticUpdate,
     LightClientFinalityUpdate,
+    /// A peer went offline
     PeerDisconnected(NodeId),
-    PeerUpdatedRecord {
+    /// A peer updated its ENR
+    EnrUpdated {
         node_id: NodeId,
-        new_record: Record,
-        prev_record: Option<Record>,
+        new_record: Arc<Enr>,
     },
 }
 
